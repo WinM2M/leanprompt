@@ -14,6 +14,9 @@ on:
         default: 'Manual PyPI deployment'
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
