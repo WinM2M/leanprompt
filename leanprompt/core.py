@@ -1,4 +1,5 @@
 import os
+import json
 import yaml
 import hashlib
 import inspect
@@ -25,7 +26,13 @@ class LeanPrompt:
         max_retries: int = 3,  # 0 = infinite
         api_prefix: str = "",
         ws_path: str = "/ws",
-        ws_auth: Optional[Callable[[WebSocket], Any]] = None,
+        ws_auth: Optional[Callable[[Union[Request, WebSocket]], Any]] = None,
+        ws_request_interceptor: Optional[
+            Callable[[WebSocket, Dict[str, Any]], Any]
+        ] = None,
+        ws_response_interceptor: Optional[
+            Callable[[WebSocket, Dict[str, Any]], Any]
+        ] = None,
         **provider_kwargs,
     ):
         self.app = app
@@ -36,6 +43,8 @@ class LeanPrompt:
         self.api_prefix = self._normalize_prefix(api_prefix)
         self.ws_path = self._initialize_ws_path(ws_path)
         self.ws_auth = ws_auth
+        self.ws_request_interceptor = ws_request_interceptor
+        self.ws_response_interceptor = ws_response_interceptor
 
         # Initialize provider
         if provider == "deepseek":
@@ -102,7 +111,9 @@ class LeanPrompt:
         normalized = self._normalize_route_path(path)
         if not self.api_prefix:
             return normalized
-        if normalized == self.api_prefix or normalized.startswith(f"{self.api_prefix}/"):
+        if normalized == self.api_prefix or normalized.startswith(
+            f"{self.api_prefix}/"
+        ):
             return normalized
         return f"{self.api_prefix}{normalized}"
 
@@ -138,6 +149,60 @@ class LeanPrompt:
         if inspect.isawaitable(result):
             result = await result
         return bool(result)
+
+    async def _run_ws_interceptor(
+        self,
+        interceptor: Optional[Callable[[WebSocket, Dict[str, Any]], Any]],
+        websocket: WebSocket,
+        payload: Dict[str, Any],
+        allow_block: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        if not interceptor:
+            return None
+        try:
+            result = interceptor(websocket, payload)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            if allow_block:
+                return {"error": str(exc) or "WebSocket request rejected"}
+            print(f"WebSocket interceptor error: {exc}")
+            return None
+
+        if not allow_block:
+            return None
+
+        if result is False:
+            return {"error": "WebSocket request rejected"}
+        if isinstance(result, dict) and result.get("error"):
+            return result
+        return None
+
+    @staticmethod
+    def _build_ws_interceptor_payload(
+        direction: str,
+        client_id: str,
+        path: Optional[str],
+        payload: Optional[Any],
+        raw: Optional[str],
+    ) -> Dict[str, Any]:
+        raw_text = raw
+        if raw_text is None and payload is not None:
+            try:
+                raw_text = json.dumps(
+                    payload, ensure_ascii=False, separators=(",", ":")
+                )
+            except (TypeError, ValueError):
+                raw_text = ""
+        byte_length = len(raw_text.encode("utf-8")) if raw_text is not None else 0
+        return {
+            "direction": direction,
+            "client_id": client_id,
+            "path": path,
+            "payload": payload,
+            "raw": raw_text,
+            "byte_length": byte_length,
+        }
 
     async def _authorize_websocket(self, websocket: WebSocket) -> bool:
         if not self.ws_auth:
@@ -189,25 +254,96 @@ class LeanPrompt:
             # History keyed by path: { "/path1": [...], "/path2": [...] }
             path_history: Dict[str, List[Dict[str, str]]] = {}
 
+            async def send_ws_json(
+                payload: Dict[str, Any], path: Optional[str]
+            ) -> None:
+                await self._run_ws_interceptor(
+                    self.ws_response_interceptor,
+                    websocket,
+                    self._build_ws_interceptor_payload(
+                        direction="outbound",
+                        client_id=client_id,
+                        path=path,
+                        payload=payload,
+                        raw=None,
+                    ),
+                )
+                await websocket.send_json(payload)
+
             try:
                 while True:
                     # Expect JSON input: {"path": "/foo", "message": "hello"}
                     try:
-                        data = await websocket.receive_json()
+                        raw_text = await websocket.receive_text()
+                        try:
+                            data = json.loads(raw_text)
+                        except json.JSONDecodeError:
+                            await self._run_ws_interceptor(
+                                self.ws_request_interceptor,
+                                websocket,
+                                self._build_ws_interceptor_payload(
+                                    direction="inbound",
+                                    client_id=client_id,
+                                    path=None,
+                                    payload=None,
+                                    raw=raw_text,
+                                ),
+                            )
+                            await send_ws_json(
+                                {"error": "Invalid JSON format", "path": None}, None
+                            )
+                            continue
+
+                        if not isinstance(data, dict):
+                            await self._run_ws_interceptor(
+                                self.ws_request_interceptor,
+                                websocket,
+                                self._build_ws_interceptor_payload(
+                                    direction="inbound",
+                                    client_id=client_id,
+                                    path=None,
+                                    payload=data,
+                                    raw=raw_text,
+                                ),
+                            )
+                            await send_ws_json(
+                                {"error": "Invalid JSON format", "path": None}, None
+                            )
+                            continue
+
                         path = data.get("path")
                         user_input = data.get("message")
 
+                        interceptor_error = await self._run_ws_interceptor(
+                            self.ws_request_interceptor,
+                            websocket,
+                            self._build_ws_interceptor_payload(
+                                direction="inbound",
+                                client_id=client_id,
+                                path=path,
+                                payload=data,
+                                raw=raw_text,
+                            ),
+                            allow_block=True,
+                        )
+                        if interceptor_error:
+                            if "path" not in interceptor_error:
+                                interceptor_error["path"] = path
+                            await send_ws_json(interceptor_error, path)
+                            continue
+
                         if not path or not user_input:
-                            await websocket.send_json(
+                            await send_ws_json(
                                 {
                                     "error": "Fields 'path' and 'message' are required",
                                     "path": path,
-                                }
+                                },
+                                path,
                             )
                             continue
                     except Exception:
-                        await websocket.send_json(
-                            {"error": "Invalid JSON format", "path": None}
+                        await send_ws_json(
+                            {"error": "Invalid JSON format", "path": None}, None
                         )
                         continue
 
@@ -215,11 +351,12 @@ class LeanPrompt:
                     prefixed_path = self._apply_prefix(path)
                     prompt_file = self.routes_info.get(prefixed_path)
                     if not prompt_file:
-                        await websocket.send_json(
+                        await send_ws_json(
                             {
                                 "error": f"No route found for path: {path}",
                                 "path": path,
-                            }
+                            },
+                            path,
                         )
                         continue
 
@@ -227,11 +364,12 @@ class LeanPrompt:
                     try:
                         config, system_prompt = self._load_prompt(prompt_file)
                     except FileNotFoundError:
-                        await websocket.send_json(
+                        await send_ws_json(
                             {
                                 "error": f"Prompt file not found: {prompt_file}",
                                 "path": path,
-                            }
+                            },
+                            path,
                         )
                         continue
 
@@ -283,7 +421,7 @@ class LeanPrompt:
                         # await websocket.send_json({"response": chunk, "partial": True})
 
                     # Send final complete response as requested
-                    await websocket.send_json({"response": full_response, "path": path})
+                    await send_ws_json({"response": full_response, "path": path}, path)
 
                     # Update History (Context Caching)
                     history.append({"role": "user", "content": user_input})

@@ -129,6 +129,71 @@ lp = LeanPrompt(
 )
 ```
 
+### WebSocket Interceptors
+
+You can intercept inbound/outbound WebSocket messages for metering, auditing, or billing.
+If the request interceptor returns `False` or `{"error": "..."}`, the request is blocked and
+the error payload is returned immediately.
+
+Interceptor signature:
+
+```python
+def interceptor(websocket: WebSocket, event: dict):
+    ...
+```
+
+Event payload shape:
+
+```json
+{
+  "direction": "inbound" | "outbound",
+  "client_id": "...",
+  "path": "/route",
+  "payload": { "path": "/route", "message": "..." } | { "response": "...", "path": "/route" },
+  "raw": "{...}",
+  "byte_length": 123
+}
+```
+
+Return behavior:
+
+- Request interceptor (`ws_request_interceptor`)
+  - Return `None` / no return: request continues to normal processing.
+  - Return `False`: request is blocked and `{ "error": "WebSocket request rejected" }` is sent.
+  - Return `{ "error": "..." }`: request is blocked and the dict is sent as-is (path is added if missing).
+  - Raise an exception: treated as blocked and `{ "error": "<exception message>" }` is sent.
+- Response interceptor (`ws_response_interceptor`)
+  - Return value is ignored; it never blocks the response.
+  - Exceptions are logged and the response still proceeds.
+
+```python
+from fastapi import WebSocket
+
+billing_state = {
+    "credits": 10_000,  # bytes
+    "usage": 0,
+}
+
+def ws_billing(websocket: WebSocket, event: dict):
+    # event keys: direction, client_id, path, payload, raw, byte_length
+    if event["direction"] == "inbound":
+        projected = billing_state["usage"] + event["byte_length"]
+        if projected > billing_state["credits"]:
+            return {"error": "Billing failed: insufficient credits", "code": "billing_failed"}
+        billing_state["usage"] = projected
+    else:
+        billing_state["usage"] += event["byte_length"]
+
+lp = LeanPrompt(
+    app,
+    provider=provider_name,
+    prompt_dir="prompts",
+    api_key=api_key,
+    ws_request_interceptor=ws_billing,
+    ws_response_interceptor=ws_billing,
+)
+```
+
 ### Complete Example Server
 
 Here's a full example with multiple endpoints:
