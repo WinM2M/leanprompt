@@ -22,6 +22,7 @@ class LeanPrompt:
         prompt_dir: str = "prompts",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,  # For Ollama or Custom URLs
+        default_model: Optional[str] = None,
         on_validation_error: str = "ignore",  # ignore, retry, raise
         max_retries: int = 3,  # 0 = infinite
         api_prefix: str = "",
@@ -38,6 +39,7 @@ class LeanPrompt:
         self.app = app
         self.prompt_dir = prompt_dir
         self.provider_name = provider
+        self.default_model = default_model
         self.on_validation_error = on_validation_error
         self.max_retries = max_retries
         self.api_prefix = self._normalize_prefix(api_prefix)
@@ -239,8 +241,15 @@ class LeanPrompt:
             if len(parts) >= 3:
                 frontmatter = yaml.safe_load(parts[1])
                 body = parts[2].strip()
+                if not frontmatter:
+                    frontmatter = {}
+                if self.default_model and not frontmatter.get("model"):
+                    frontmatter = {**frontmatter, "model": self.default_model}
                 return frontmatter, body
-        return {}, content.strip()
+        frontmatter: Dict[str, Any] = {}
+        if self.default_model:
+            frontmatter["model"] = self.default_model
+        return frontmatter, content.strip()
 
     def _setup_websocket(self):
         # WebSocket endpoint with Context Caching (Session Memory)
