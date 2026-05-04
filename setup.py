@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="leanprompt",
-    version="0.4.1",
+    version="0.4.2",
     author="Youngjune Kwon",
     author_email="yjkwon@winm2m.com",
     description="A FastAPI-based LLM integration framework for engineering-centric AI development.",
