@@ -5,6 +5,7 @@ import hashlib
 import inspect
 from typing import Optional, Type, Callable, Dict, Any, List, Union, Awaitable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from starlette.websockets import WebSocketState
 from pydantic import BaseModel, ValidationError
 from .providers.deepseek import DeepSeekProvider
 from .providers.openai import OpenAIProvider
@@ -265,7 +266,11 @@ class LeanPrompt:
 
             async def send_ws_json(
                 payload: Dict[str, Any], path: Optional[str]
-            ) -> None:
+            ) -> bool:
+                # Guard against sending after close/disconnect.
+                if websocket.client_state != WebSocketState.CONNECTED:
+                    return False
+
                 await self._run_ws_interceptor(
                     self.ws_response_interceptor,
                     websocket,
@@ -277,7 +282,11 @@ class LeanPrompt:
                         raw=None,
                     ),
                 )
-                await websocket.send_json(payload)
+                try:
+                    await websocket.send_json(payload)
+                    return True
+                except (RuntimeError, WebSocketDisconnect):
+                    return False
 
             try:
                 while True:
@@ -350,10 +359,14 @@ class LeanPrompt:
                                 path,
                             )
                             continue
+                    except WebSocketDisconnect:
+                        raise
                     except Exception:
-                        await send_ws_json(
+                        sent = await send_ws_json(
                             {"error": "Invalid JSON format", "path": None}, None
                         )
+                        if not sent:
+                            break
                         continue
 
                     # Lookup prompt file from routes_info
