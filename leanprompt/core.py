@@ -260,7 +260,14 @@ class LeanPrompt:
         async def websocket_endpoint(websocket: WebSocket, client_id: str):
             if not await self._authorize_websocket(websocket):
                 return
-            await websocket.accept()
+            if websocket.client_state == WebSocketState.CONNECTED:
+                pass
+            else:
+                try:
+                    await websocket.accept()
+                except RuntimeError as exc:
+                    if "websocket.accept" not in str(exc):
+                        raise
             # History keyed by path: { "/path1": [...], "/path2": [...] }
             path_history: Dict[str, List[Dict[str, str]]] = {}
 
